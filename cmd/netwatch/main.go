@@ -58,11 +58,23 @@ func run(ctx context.Context, args []string) error {
 		}
 		now := time.Now().UTC()
 		devices := []scanner.Device{}
+		progressShown := false
 		if cmd == "scan" || cmd == "devices" || cmd == "security" || cmd == "report" {
 			fmt.Println("NETWATCH — NETWORK SECURITY ANALYZER\n[+] Detecting local network...")
-			devices, err = scanner.Discover(ctx, n, *duration, p)
+			devices, err = scanner.DiscoverWithProgress(ctx, n, *duration, p, func(pr scanner.Progress) {
+				progressShown = true
+				fmt.Fprintf(os.Stderr, "\r%s: %d/%d addresses checked, %d devices found, %s elapsed", pr.Stage, pr.Checked, pr.Total, pr.Found, pr.Elapsed.Truncate(time.Second))
+				if pr.Checked >= pr.Total {
+					fmt.Fprintln(os.Stderr)
+				}
+			}, func(ev scanner.Event) {
+				fmt.Fprintf(os.Stderr, "\n[+] %s %s %s\n", ev.Type, ev.IP, ev.Detail)
+			})
 			if err != nil {
 				return err
+			}
+			if progressShown {
+				fmt.Fprintln(os.Stderr)
 			}
 		}
 		issues := []security.Issue{}
@@ -110,11 +122,25 @@ func run(ctx context.Context, args []string) error {
 		fmt.Printf("Latency: %s\nPacket loss: %.1f%%\nDownload/upload: %s\n", s.Latency, s.PacketLoss, s.Note)
 		return nil
 	case "monitor":
+		fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+		interval := fs.Duration("interval", 5*time.Second, "time between monitoring scans")
+		portsArg := fs.String("ports", "", "TCP ports/range, e.g. 22,80,1-1000")
+		logPath := fs.String("log", "netwatch-events.jsonl", "append event history to JSONL file; empty disables logging")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
 		n, err := network.Detect()
 		if err != nil {
 			return err
 		}
-		return scanner.Monitor(ctx, n, 5*time.Second)
+		ports := scanner.DefaultPorts()
+		if *portsArg != "" {
+			ports, err = scanner.ParsePorts(*portsArg)
+			if err != nil {
+				return err
+			}
+		}
+		return scanner.MonitorWithOptions(ctx, n, *interval, ports, os.Stdout, *logPath)
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)

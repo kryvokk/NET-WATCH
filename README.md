@@ -9,7 +9,9 @@ NetWatch is a standard-library-only Go CLI for authorized local network inventor
 - Reports hostnames only when reverse DNS provides one. MAC addresses are reported when available from the Linux neighbor table.
 - Flags exposed Telnet, FTP, SMB, and RDP with contextual risk notes. An open port is not proof of a vulnerability.
 - Reports TCP gateway latency and connection failure rate, and clearly states when throughput was not measured.
-- Watches for host appearance/disappearance and emits events in real time.
+- Shows scan progress and emits host/open-port findings as they arrive.
+- Monitors hosts and common TCP services in a refreshed table, reporting network and device changes as events.
+- Appends device and service change history to a JSONL event log.
 - Exports human-readable TXT or JSON reports.
 
 ## Requirements
@@ -35,8 +37,12 @@ netwatch devices
 netwatch security
 netwatch speedtest
 netwatch monitor
+netwatch monitor --interval 10s --ports 22,80,443 --log netwatch-events.jsonl
+netwatch monitor --log ""                 # disable event history
 netwatch report --format json --output report.json
 ```
+
+During scans, progress and discovery events are written to stderr so the final report on stdout remains usable in a pipe. `monitor` refreshes a device table every interval and reports `device_appeared`, `device_disappeared`, `new_service`, and `open_service` events. The default append-only history file is `netwatch-events.jsonl` in the current directory; each line is a JSON event with a UTC timestamp.
 
 The five-minute duration is a maximum scan budget, not a forced waiting period. Host discovery is limited to 64 concurrent probes; TCP checks have short timeouts. Devices that do not answer any of the reachability probes may not be discovered. Reports include each selected port as open, closed, or filtered/unknown based on the TCP connect result. Operating systems and firewalls may make closed and filtered states indistinguishable.
 

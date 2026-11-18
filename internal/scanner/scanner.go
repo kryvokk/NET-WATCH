@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"netwatch/internal/network"
+	"os"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -27,10 +29,24 @@ type Device struct {
 	Type     string `json:"device_type,omitempty"`
 }
 
+type Progress struct {
+	Stage                 string
+	Checked, Total, Found int
+	Elapsed               time.Duration
+}
+type Event struct {
+	Type, IP, Detail string
+	At               time.Time
+}
+
 var common = []int{21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 3389, 5432, 8080}
 var services = map[int]string{21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 110: "pop3", 139: "netbios", 143: "imap", 443: "https", 445: "smb", 3306: "mysql", 3389: "rdp", 5432: "postgresql", 8080: "http-alt"}
 
 func DefaultPorts() []int { return append([]int{}, common...) }
+
+func DiscoverWithProgress(ctx context.Context, n network.Info, budget time.Duration, ports []int, progress func(Progress), event func(Event)) ([]Device, error) {
+	return discover(ctx, n, budget, ports, progress, event)
+}
 func ParsePorts(s string) ([]int, error) {
 	m := map[int]bool{}
 	for _, part := range strings.Split(s, ",") {
@@ -64,6 +80,9 @@ func ParsePorts(s string) ([]int, error) {
 	return r, nil
 }
 func Discover(ctx context.Context, n network.Info, budget time.Duration, ports []int) ([]Device, error) {
+	return discover(ctx, n, budget, ports, nil, nil)
+}
+func discover(ctx context.Context, n network.Info, budget time.Duration, ports []int, progress func(Progress), event func(Event)) ([]Device, error) {
 	_, ipnet, e := net.ParseCIDR(n.CIDR)
 	if e != nil {
 		return nil, e
@@ -84,6 +103,11 @@ func Discover(ctx context.Context, n network.Info, budget time.Duration, ports [
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	found := []Device{}
+	started := time.Now()
+	checked, foundCount := 0, 0
+	if progress != nil {
+		progress(Progress{Stage: "discovering hosts", Total: hosts - 2})
+	}
 	deadline := time.Now().Add(budget)
 scanHosts:
 	for i := 1; i < hosts-1; i++ {
@@ -105,9 +129,28 @@ scanHosts:
 			defer wg.Done()
 			defer func() { <-sem }()
 			if !alive(scanCtx, addr) {
+				mu.Lock()
+				checked++
+				p := Progress{Stage: "discovering hosts", Checked: checked, Total: hosts - 2, Found: foundCount, Elapsed: time.Since(started)}
+				mu.Unlock()
+				if progress != nil {
+					progress(p)
+				}
 				return
 			}
-			d := Device{IP: addr, Ports: scanPorts(scanCtx, addr, ports)}
+			if event != nil {
+				event(Event{Type: "device_found", IP: addr, Detail: "host responded", At: time.Now().UTC()})
+			}
+			d := Device{IP: addr}
+			for _, port := range ports {
+				checkedPort := scanPorts(scanCtx, addr, []int{port})
+				if len(checkedPort) > 0 {
+					d.Ports = append(d.Ports, checkedPort[0])
+					if checkedPort[0].State == "open" && event != nil {
+						event(Event{Type: "open_port", IP: addr, Detail: fmt.Sprintf("%d/%s", port, checkedPort[0].Service), At: time.Now().UTC()})
+					}
+				}
+			}
 			lookupCtx, cancelLookup := context.WithTimeout(scanCtx, 300*time.Millisecond)
 			if names, _ := net.DefaultResolver.LookupAddr(lookupCtx, addr); len(names) > 0 {
 				d.Hostname = strings.TrimSuffix(names[0], ".")
@@ -127,7 +170,13 @@ scanHosts:
 			}
 			mu.Lock()
 			found = append(found, d)
+			foundCount++
+			checked++
+			p := Progress{Stage: "discovering hosts", Checked: checked, Total: hosts - 2, Found: foundCount, Elapsed: time.Since(started)}
 			mu.Unlock()
+			if progress != nil {
+				progress(p)
+			}
 		}(addr)
 	}
 	wg.Wait()
@@ -202,7 +251,25 @@ func scanPorts(ctx context.Context, ip string, ports []int) []Port {
 }
 
 func Monitor(ctx context.Context, n network.Info, interval time.Duration) error {
-	known := map[string]bool{}
+	return MonitorWithOptions(ctx, n, interval, DefaultPorts(), os.Stdout, "")
+}
+func MonitorWithOptions(ctx context.Context, n network.Info, interval time.Duration, ports []int, out io.Writer, logPath string) error {
+	known := map[string]Device{}
+	var logFile *os.File
+	if logPath != "" {
+		f, e := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if e != nil {
+			return e
+		}
+		defer f.Close()
+		logFile = f
+	}
+	logEvent := func(ev Event) {
+		fmt.Fprintf(out, "[%s] %s %s %s\n", ev.At.Format(time.RFC3339), ev.Type, ev.IP, ev.Detail)
+		if logFile != nil {
+			fmt.Fprintf(logFile, "{\"at\":%q,\"type\":%q,\"ip\":%q,\"detail\":%q}\n", ev.At.Format(time.RFC3339), ev.Type, ev.IP, ev.Detail)
+		}
+	}
 	previous := n
 	for {
 		if current, err := network.Detect(); err == nil {
@@ -212,20 +279,54 @@ func Monitor(ctx context.Context, n network.Info, interval time.Duration) error 
 			}
 			n = current
 		}
-		ds, e := Discover(ctx, n, interval, []int{})
+		ds, e := DiscoverWithProgress(ctx, n, interval, ports, func(p Progress) {
+			fmt.Fprintf(out, "\r%s: %d/%d addresses, %d devices, %s elapsed", p.Stage, p.Checked, p.Total, p.Found, p.Elapsed.Truncate(time.Second))
+			if p.Checked >= p.Total {
+				fmt.Fprintln(out)
+			}
+		}, nil)
 		if e != nil {
 			return e
 		}
-		current := map[string]bool{}
+		current := map[string]Device{}
+		fmt.Fprintf(out, "\n%-16s %-22s %s\n", "IP", "HOSTNAME", "OPEN PORTS")
 		for _, d := range ds {
-			current[d.IP] = true
-			if !known[d.IP] {
-				fmt.Printf("[+] Device appeared: %s\n", d.IP)
+			current[d.IP] = d
+			open := func(x Device) map[int]string {
+				m := map[int]string{}
+				for _, p := range x.Ports {
+					if p.State == "open" {
+						m[p.Number] = p.Service
+					}
+				}
+				return m
+			}
+			portsText := ""
+			for _, p := range d.Ports {
+				if p.State == "open" {
+					portsText += fmt.Sprintf(" %d/%s", p.Number, p.Service)
+				}
+			}
+			fmt.Fprintf(out, "%-16s %-22s %s\n", d.IP, d.Hostname, portsText)
+			if _, ok := known[d.IP]; !ok {
+				logEvent(Event{Type: "device_appeared", IP: d.IP, Detail: "device is online", At: time.Now().UTC()})
+			} else {
+				old := open(known[d.IP])
+				for port, svc := range open(d) {
+					if _, ok := old[port]; !ok {
+						logEvent(Event{Type: "new_service", IP: d.IP, Detail: fmt.Sprintf("%d/%s", port, svc), At: time.Now().UTC()})
+					}
+				}
+			}
+			if _, ok := known[d.IP]; !ok {
+				for port, svc := range open(d) {
+					logEvent(Event{Type: "open_service", IP: d.IP, Detail: fmt.Sprintf("%d/%s", port, svc), At: time.Now().UTC()})
+				}
 			}
 		}
 		for ip := range known {
-			if !current[ip] {
-				fmt.Printf("[-] Device disappeared: %s\n", ip)
+			if _, ok := current[ip]; !ok {
+				logEvent(Event{Type: "device_disappeared", IP: ip, Detail: "device is offline", At: time.Now().UTC()})
 			}
 		}
 		known = current
